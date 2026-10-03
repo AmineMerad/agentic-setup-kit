@@ -1,0 +1,5 @@
+{
+  "mcpServers": {
+    "obsidian": { "type": "stdio", "command": "bash", "args": ["scripts/mcp-obsidian.sh"] }
+  }
+}

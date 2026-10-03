@@ -1,0 +1,5 @@
+{
+  "mcp": {
+    "obsidian": { "type": "local", "command": ["bash", "scripts/mcp-obsidian.sh"], "enabled": true }
+  }
+}
