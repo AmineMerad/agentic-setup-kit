@@ -327,6 +327,119 @@ class Installer(unittest.TestCase):
         self.assertIn("error TS9", r.stderr)
 
 
+class AgentsModules(unittest.TestCase):
+    def repo(self, files=None):
+        repo = make_repo(files or {"package.json": json.dumps({"scripts": {}})})
+        sh(["git", "remote", "add", "origin", "git@github.com:acme/widgets.git"], repo)
+        self.addCleanup(shutil.rmtree, repo, True)
+        return repo
+
+    def scan(self, repo, *args, **env):
+        r = sh([sys.executable, os.path.join(repo, ".agent-kit/orchestrator/next-tickets.py"), *args], repo,
+               env=dict(GIT_ENV, PATH="/usr/bin:/bin", **env))  # no gh on PATH: open-PR exclusion is skipped
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r.stdout.split()
+
+    def ticket(self, repo, tid, status="todo", deps="", extra=""):
+        write(repo, "vault/tickets/%s.md" % tid,
+              "---\nid: %s\nstatus: %s\ndepends_on: [%s]\n%s---\n" % (tid, status, deps, extra))
+
+    def test_agents_only_has_no_orchestrator(self):
+        repo = self.repo()
+        r = install(repo, "--with-agents")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        for rel in (".agent-kit/agents/agentctl.sh", ".agent-kit/agents/agent-finish.sh",
+                    ".agent-kit/agents/tasks/_TEMPLATE-task.txt", ".agent-kit/agents.mk"):
+            self.assertTrue(os.path.exists(os.path.join(repo, rel)), rel)
+        self.assertTrue(os.access(os.path.join(repo, ".agent-kit/agents/agentctl.sh"), os.X_OK))
+        self.assertFalse(os.path.exists(os.path.join(repo, ".agent-kit/orchestrator")))
+        self.assertIn("-include .agent-kit/agents.mk", rd(os.path.join(repo, "Makefile")))
+        self.assertIn(".worktrees/", rd(os.path.join(repo, ".gitignore")))
+
+    def test_orchestrator_install_is_idempotent_and_appends_to_existing_files(self):
+        repo = self.repo({"package.json": "{}", "Makefile": "build:\n\techo hi\n", ".gitignore": "node_modules\n"})
+        install(repo, "--with-orchestrator")
+        self.assertTrue(rd(os.path.join(repo, "Makefile")).startswith("build:\n\techo hi\n"))
+        self.assertTrue(rd(os.path.join(repo, ".gitignore")).startswith("node_modules\n"))
+        env = rd(os.path.join(repo, ".env.agents.example"))
+        self.assertIn("REPO_SLUG=acme/widgets", env)
+        self.assertTrue(os.path.exists(os.path.join(repo, "vault/tickets/_TEMPLATE.md")))
+        snap = {rel: rd(os.path.join(repo, rel)) for rel in ("Makefile", ".gitignore", ".env.agents.example")}
+        r = install(repo, "--with-orchestrator")
+        self.assertNotIn("install ", r.stdout.replace("\x1b[0;32m", ""))
+        for rel, text in snap.items():
+            self.assertEqual(rd(os.path.join(repo, rel)), text, rel)
+
+    def test_shipped_shell_scripts_parse(self):
+        repo = self.repo()
+        install(repo, "--with-orchestrator")
+        for rel in (".agent-kit/agents/agentctl.sh", ".agent-kit/agents/agent-finish.sh",
+                    ".agent-kit/orchestrator/boot.sh", ".agent-kit/orchestrator/supervisor.sh"):
+            r = sh(["bash", "-n", os.path.join(repo, rel)], repo)
+            self.assertEqual(r.returncode, 0, "%s: %s" % (rel, r.stderr))
+
+    def test_no_project_specific_leftovers_in_payload(self):
+        for sub in ("agents", "orchestrator"):
+            for root, _d, files in os.walk(os.path.join(KIT, "payload/optional", sub)):
+                for fn in files:
+                    path = os.path.join(root, fn)
+                    for bad in ("qr-menu", "AmineMerad", "CODEMAP", "/Users/", ".opencode/agents"):
+                        self.assertNotIn(bad, rd(path), "%s contains %r" % (path, bad))
+
+    def test_scanner_orders_by_priority_and_blocks_on_unmerged_deps(self):
+        repo = self.repo()
+        install(repo, "--with-orchestrator")
+        self.ticket(repo, "A-01", extra="priority: low\n")
+        self.ticket(repo, "A-02", extra="priority: urgent\n")
+        self.ticket(repo, "A-03", deps="A-01")            # dep still todo -> blocked
+        self.ticket(repo, "A-04", status="done")
+        self.ticket(repo, "A-05", deps="A-04", extra="priority: medium\n")  # dep done -> ready
+        self.ticket(repo, "A-06", deps="NOPE-1")          # unknown dep -> blocked
+        self.assertEqual(self.scan(repo), ["A-02", "A-05", "A-01"])
+
+    def test_scanner_filters_branches_and_parked(self):
+        repo = self.repo()
+        install(repo, "--with-orchestrator")
+        for t in ("B-01", "B-02", "B-03"):
+            self.ticket(repo, t)
+        sh(["git", "branch", "b-02"], repo)                                    # branch exists -> excluded
+        r = sh([sys.executable, os.path.join(repo, ".agent-kit/orchestrator/state.py"), "park", "B-03", "x"], repo)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.scan(repo), ["B-01"])
+        self.assertEqual(self.scan(repo, TICKETS="B-02,B-03"), [])            # explicit ids don't bypass exclusions
+
+    def test_scanner_honours_tickets_dir_and_series_and_task_file_name(self):
+        repo = self.repo()
+        install(repo, "--with-orchestrator")
+        write(repo, "work/C-01.md", "---\nid: C-01\nstatus: todo\nseries: web\nfiles: [a/b]\n---\n")
+        write(repo, "work/C-02.md", "---\nid: C-02\nstatus: todo\nseries: api\n---\n")
+        write(repo, ".agent-kit/agents/tasks/x-c-01-task.txt",
+              'bash .agent-kit/agents/agent-finish.sh web-c01 main "feat: c (C-01)"\n')
+        self.assertEqual(self.scan(repo, TICKETS_DIR="work", SERIES="web"), ["C-01"])
+        out = self.scan(repo, "--json", TICKETS_DIR="work", SERIES="web")
+        rec = json.loads(" ".join(out))
+        self.assertEqual((rec["name"], rec["files"]), ("web-c01", ["a/b"]))
+        self.assertTrue(rec["task_file"].endswith("x-c-01-task.txt"))
+
+    def test_state_store_roundtrip_and_supervisor_dry_run(self):
+        repo = self.repo()
+        install(repo, "--with-orchestrator")
+        st = os.path.join(repo, ".agent-kit/orchestrator/state.py")
+        sh([sys.executable, st, "set-running", "d-01", "d-01", "123", "a,b", "t.txt", "feat: d"], repo)
+        row = sh([sys.executable, st, "running"], repo).stdout.rstrip("\n").split("\t")
+        self.assertEqual(row[:4], ["d-01", "D-01", "123", "a,b"])
+        self.assertEqual(sh([sys.executable, st, "bump-attempts", "D-01"], repo).stdout.strip(), "1")
+        sh([sys.executable, st, "clear-running", "d-01"], repo)
+        self.assertEqual(sh([sys.executable, st, "running"], repo).stdout, "")
+        self.ticket(repo, "D-02")
+        r = sh(["bash", os.path.join(repo, ".agent-kit/orchestrator/supervisor.sh")], repo,
+               env=dict(GIT_ENV, DRY_RUN="1", WORKSPACE=repo, PATH="/usr/bin:/bin"))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('"id": "D-02"', r.stdout)
+        # supervisor state is runtime-only: must be git-ignored
+        self.assertEqual(sh(["git", "status", "--porcelain", "--", ".agent-kit/agents/state"], repo).stdout, "")
+
+
 @unittest.skipUnless(shutil.which("node"), "node not installed")
 class OpencodePlugin(unittest.TestCase):
     def test_reprompts_once_dedupes_and_skips_subagents(self):

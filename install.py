@@ -2,6 +2,7 @@
 """Install the agentic setup kit into a git repository.
 
     python3 install.py [TARGET] [--dry-run] [--force] [--with-obsidian] [--global-rules]
+                       [--with-agents] [--with-orchestrator]
 
 Idempotent. Never overwrites an existing file unless --force; JSON config files are *merged*
 (your existing settings win; missing keys are added). Stdlib only.
@@ -9,6 +10,7 @@ Idempotent. Never overwrites an existing file unless --force; JSON config files 
 import argparse
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -140,6 +142,71 @@ def merge_json(ctx, dst_rel, fragment_path, kind=None):
             f.write("\n")
 
 
+# ── agents / orchestrator modules ───────────────────────────────────────────────────────
+GITIGNORE_MARK = "# agentic-setup-kit: agents"
+GITIGNORE_BLOCK = """%s
+.worktrees/
+.env.agents
+.agent-kit/agents/state/
+.agent-kit/agents/*.log
+.agent-kit/agents/*.pid
+.agent-kit/agents/*-attempt*-task.txt
+""" % GITIGNORE_MARK
+MAKE_INCLUDE = "-include .agent-kit/agents.mk"
+
+
+def install_tree(ctx, src_root, exclude=()):
+    """Copy every file under src_root into the target at the same relative path. Scripts get +x."""
+    for dirpath, _dirs, files in os.walk(src_root):
+        for fn in sorted(files):
+            src = os.path.join(dirpath, fn)
+            rel = os.path.relpath(src, src_root)
+            if rel in exclude or fn == ".DS_Store" or fn.endswith(".pyc"):
+                continue
+            copy_file(ctx, src, rel, executable=fn.endswith((".sh", ".py")))
+
+
+def append_block(ctx, rel, marker, text):
+    """Append text to rel unless marker is already in it (creates the file when absent)."""
+    dst = os.path.join(ctx.target, rel)
+    old = open(dst).read() if os.path.exists(dst) else ""
+    if marker in old:
+        ctx.say("ok    %s — already has the kit block" % rel)
+        return
+    ctx.did("append " if old else "create ", rel)
+    if not ctx.dry:
+        with open(dst, "w") as f:
+            f.write(old + ("" if not old or old.endswith("\n") else "\n") + ("\n" if old else "") + text)
+
+
+def github_slug(target):
+    r = subprocess.run(["git", "-C", target, "remote", "get-url", "origin"], capture_output=True, text=True)
+    m = re.search(r"github\.com[:/]([^/\s]+/[^/\s]+?)(?:\.git)?\s*$", r.stdout) if r.returncode == 0 else None
+    return m.group(1) if m else None
+
+
+def install_agents(ctx):
+    install_tree(ctx, os.path.join(PAYLOAD, "optional/agents"))
+    append_block(ctx, ".gitignore", GITIGNORE_MARK, GITIGNORE_BLOCK)
+    mk = os.path.join(ctx.target, "Makefile")
+    if os.path.exists(mk):
+        append_block(ctx, "Makefile", "agents.mk", MAKE_INCLUDE + "\n")
+    else:
+        write_text(ctx, "Makefile", ".DEFAULT_GOAL := agents-list\n" + MAKE_INCLUDE + "\n")
+
+
+def install_orchestrator(ctx):
+    opt = os.path.join(PAYLOAD, "optional/orchestrator")
+    install_tree(ctx, opt, exclude=("templates/ticket.md", ".env.agents.example"))
+    ticket_dir = os.path.join("vault", "tickets")
+    copy_file(ctx, os.path.join(opt, "templates/ticket.md"), os.path.join(ticket_dir, "_TEMPLATE.md"))
+    slug = github_slug(ctx.target)
+    text = open(os.path.join(opt, ".env.agents.example")).read().replace("__REPO_SLUG__", slug or "owner/name")
+    write_text(ctx, ".env.agents.example", text)
+    if not slug:
+        ctx.say("      no GitHub origin found — set REPO_SLUG in .env.agents.example", YELLOW)
+
+
 # ── verify.json generation ──────────────────────────────────────────────────────────────
 def detect_checks(root):
     pkg = os.path.join(root, "package.json")
@@ -182,6 +249,10 @@ def main():
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--force", action="store_true", help="overwrite existing files (not JSON merges)")
     ap.add_argument("--with-obsidian", action="store_true", help="also wire a portable Obsidian MCP server")
+    ap.add_argument("--with-agents", action="store_true",
+                    help="add the worktree-per-agent launcher (agentctl.sh), agent-finish.sh (verify→commit→PR) and agents.mk")
+    ap.add_argument("--with-orchestrator", action="store_true",
+                    help="add the Docker ticket orchestrator (implies --with-agents)")
     ap.add_argument("--global-rules", action="store_true",
                     help="install the terse global rules into ~/.claude/CLAUDE.md and ~/.config/opencode/AGENTS.md if absent")
     a = ap.parse_args()
@@ -220,6 +291,11 @@ def main():
                 os.makedirs(os.path.dirname(keep), exist_ok=True)
                 open(keep, "w").close()
 
+    if a.with_agents or a.with_orchestrator:
+        install_agents(ctx)
+    if a.with_orchestrator:
+        install_orchestrator(ctx)
+
     if a.global_rules:
         rules = open(os.path.join(PAYLOAD, "global-rules.md")).read()
         for dest in ("~/.claude/CLAUDE.md", "~/.config/opencode/AGENTS.md"):
@@ -242,6 +318,11 @@ def main():
         print("  2. Fill the TODOs in AGENTS.md.")
         print("  3. Restart Claude Code / opencode so the hook, plugin and permissions load.")
         print("  4. Try it: edit a file, break the typecheck, let the agent finish — it should be sent back to fix it.")
+        if a.with_agents or a.with_orchestrator:
+            print("  5. COMMIT the kit files before launching agents — worktrees branch from a commit, not your working tree.")
+            print("     Then: make agents-up FILE=.agent-kit/agents/tasks/<task>.txt NAME=<name> BASE=main")
+        if a.with_orchestrator:
+            print("  6. cp .env.agents.example .env.agents (set GH_TOKEN), make agents-image, make agents-orchestrator DRY_RUN=1")
     return 0
 
 
