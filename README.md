@@ -16,6 +16,8 @@ mechanical instead of advisory.
 | **No destructive git** | Denies `stash`, `reset --hard`, `clean`, `checkout --`, force-push | `permissions.deny` | `permission.bash` |
 | **One instruction source** | `AGENTS.md` holds the facts; `CLAUDE.md` is a 10-line file that imports it | `@AGENTS.md` | reads `AGENTS.md` natively |
 | **Terse, safe global rules** *(opt-in)* | Search-before-read, smallest diff, narrow tests first, shared-checkout rules | `~/.claude/CLAUDE.md` | `~/.config/opencode/AGENTS.md` |
+| **Worktree agents + PR automation** *(opt-in)* | One isolated git worktree per agent; `agent-finish.sh` verifies, commits, pushes, opens the PR | `make agents-up` | `make agents-up` |
+| **Autonomous ticket runner** *(opt-in)* | Docker container scans tickets, launches/monitors/retries agents, one PR per ticket | `make agents-orchestrator` | `make agents-orchestrator` |
 | **Portable Obsidian MCP** *(opt-in)* | Launcher resolves the vault from its own path — no hard-coded absolute paths | `.mcp.json` | `opencode.json` |
 
 The verification script is stack-agnostic: it only knows about **globs and shell commands** from
@@ -32,7 +34,7 @@ python3 agentic-setup-kit/install.py /path/to/your/repo             # install
 ```
 
 Flags: `--dry-run`, `--force` (overwrite files; JSON configs are always merged, never replaced),
-`--with-obsidian`, `--global-rules`.
+`--with-obsidian`, `--with-agents`, `--with-orchestrator` (implies `--with-agents`), `--global-rules`.
 
 The installer is idempotent and conservative: it never overwrites an existing file without `--force`,
 **merges** into an existing `.claude/settings.json` / `opencode.json` (your values win), refuses to touch
@@ -111,6 +113,56 @@ printf '{"cwd":"%s"}' "$PWD" | scripts/agent-verify.sh || { echo "fix and retry"
 - `--global-rules` — writes `payload/global-rules.md` to `~/.claude/CLAUDE.md` and
   `~/.config/opencode/AGENTS.md` **only if they don't exist**. Edit one, copy to the other.
 
+## Worktree agents (`--with-agents`)
+
+Installs `.agent-kit/agents/{agentctl.sh,agent-finish.sh}`, a task-file template, `.agent-kit/agents.mk`, and
+appends `-include .agent-kit/agents.mk` to your `Makefile` (creates one if absent) plus a marked block to
+`.gitignore` (`.worktrees/`, `.env.agents`, agent logs/state).
+
+```bash
+make agents-up FILE=.agent-kit/agents/tasks/foo-task.txt NAME=foo BASE=main   # headless opencode in .worktrees/foo
+make agents-list | agents-log NAME=foo | agents-stop NAME=foo
+```
+
+The agent works only inside `.worktrees/<NAME>` (branch `<NAME>`, cut from `BASE`). Its last step is
+`agent-finish.sh <NAME> <BASE> "<title>"`: **verify** (`scripts/agent-verify.sh`, i.e. your
+`.agent-kit/verify.json`; nothing is committed if it fails) → commit → push → open/update the PR → remove the
+worktree. Because worktrees branch from a *commit*, **commit the kit (and any code the task depends on) to
+`BASE` first** — uncommitted files do not exist in the worktree.
+
+## Autonomous ticket runner (`--with-orchestrator`)
+
+Adds `.agent-kit/orchestrator/` (Docker image + supervisor), `.env.agents.example` (pre-filled with your GitHub
+`REPO_SLUG`) and `vault/tickets/_TEMPLATE.md`. A long-running container clones your repo into a volume, then
+loops: pick ready tickets → launch one worktree agent each → reap (PR opened / PR-create repaired / failed) →
+retry with the failure log appended → park after `MAX_ATTEMPTS`.
+
+```bash
+cp .env.agents.example .env.agents          # set GH_TOKEN (PAT: contents + pull requests)
+make agents-image
+make agents-orchestrator DRY_RUN=1          # prints the ready set and exits
+make agents-orchestrator [SERIES=core] [TICKETS=X-01,X-02] [MAX_PARALLEL=2] [MAX_ATTEMPTS=3]
+make agents-orchestrator-logs | -status | -shell | -stop
+```
+
+**Ticket format** — Markdown with frontmatter in `$TICKETS_DIR` (default `vault/tickets`, see
+`_TEMPLATE.md`): `id` (`ABC-12`), `status`, `priority`, `phase`, `series`, `depends_on`, `files`. A ticket is
+*ready* when `status: todo`, every dependency is `status: done` **on the base branch** (so dependents wait for
+the earlier PR to merge), it has no branch/open PR/parked flag, and — checked at launch — its `files` don't
+overlap a running agent. Order: priority → phase → id.
+
+**Task files** — each ticket needs `.agent-kit/agents/tasks/<name>-task.txt` (see `_TEMPLATE-task.txt`). When
+one is missing, the supervisor asks an LLM *planner* session (`planner-prompt.md`) to write it, and again to
+triage parked tickets. Everything else (scan, launch, retry, PR repair, stall kill) is plain bash/python.
+
+**Make it yours** — the `Dockerfile` is generic Node (pnpm via corepack); add your toolchain for other stacks, and
+set `INSTALL_CMD` in `.env.agents` if lockfile auto-detection (pnpm/yarn/npm) is not right. Extra `docker run`
+flags: `AGENTS_DOCKER_ARGS="-v cache:/path"`. Env knobs are listed in `.env.agents.example`.
+
+Caveats: agents run with `--auto` (no permission prompts) and `GH_TOKEN` in their environment — the container is
+the only sandbox, so use a fine-scoped PAT. The image build and a full container run need Docker and network;
+the kit's tests cover the scripts, scanner, state store and installer but not a live container.
+
 ## Limits (read these)
 
 - The opencode plugin can only react **after** an assistant turn ends; it cannot veto it (Claude Code's
@@ -120,7 +172,7 @@ printf '{"cwd":"%s"}' "$PWD" | scripts/agent-verify.sh || { echo "fix and retry"
   files they didn't touch.
 - Permission patterns are best-effort guardrails, not a security boundary.
 - Auto-detection covers only a root-level Node project; everything else needs a hand-written config.
-- Not included (yet): a worktree-per-agent launcher, PR/finish automation, a dev-server-per-worktree helper.
+- Not included (yet): a dev-server-per-worktree helper. Worker agents and the orchestrator run on **opencode** (`opencode run --auto`); there is no Claude Code worker yet.
 
 ## More
 
@@ -130,7 +182,7 @@ printf '{"cwd":"%s"}' "$PWD" | scripts/agent-verify.sh || { echo "fix and retry"
 ## Develop / test
 
 ```bash
-python3 -m unittest discover -s tests -v   # verify script, installer merges, opencode plugin
+python3 -m unittest discover -s tests -v   # verify script, installer merges, agents/orchestrator modules, opencode plugin
 ```
 
 ## License

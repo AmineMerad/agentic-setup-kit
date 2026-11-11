@@ -48,3 +48,21 @@ rules the user already wrote — doing so would override their denies.
 worktree. A launcher script that derives `<repo>/vault` from `$0` makes both harness configs path-free, and
 inside a worktree it serves that worktree's own vault. Personal/authenticated MCP servers belong in user-level
 config, not the repo.
+
+## Judgement vs determinism in the ticket runner
+Launching, monitoring, retrying and PR repair are pure bash/python (`supervisor.sh`, `next-tickets.py`,
+`state.py`): they must not hallucinate and are unit-testable. An LLM planner is consulted only for two
+judgement calls — writing a missing task file, and triaging a parked ticket — through a fixed reply contract
+(`TASKFILES_WRITTEN:` / `NOTHING_TO_DO`). Success is detected from the worker log (`✅ finished:` + `PR: http…`),
+the same contract a human-launched agent produces, so manual and unattended runs share one code path.
+
+## Dependencies unblock on merge, not on PR
+A ticket's `depends_on` must be `status: done` on the *base branch*. Workers flip `status: done` in their own
+PR, so a dependent ticket cannot start until that PR is merged. Slower than chaining branches, but each agent
+starts from code a human has already accepted.
+
+## Everything under `.agent-kit/`
+The ported harness originally lived in `.opencode/agents` and `scripts/orchestrator`. The kit keeps all of its
+files under `.agent-kit/` (plus `scripts/agent-verify.*`) so it is one directory to review, update or delete,
+and nothing collides with a repo's own `scripts/` or opencode config. Paths are resolved relative to the
+script's own location or the repo root, never hard-coded to a project.

@@ -1,0 +1,25 @@
+# Task: implement ticket <ID> — <title> (<series>)
+
+Implement ticket <ID> from `vault/tickets/<ID>.md`. The ticket is the source of truth. Your branch is
+based on committed `main`; do not rely on uncommitted files.
+
+## Instructions
+
+1. **Read first**: the ticket, the 2–5 source files it touches, `AGENTS.md`, and any ticket it depends on.
+2. **Build per the ticket**: restate each acceptance criterion as a concrete edit. Stay inside the
+   ticket's `files:` list — no drive-by refactors, renames or reformatting.
+3. **Tests (mandatory)**: extend <test file(s)> with <cases>. A change without a test is not done.
+4. **Verification (all must pass)**:
+   - <exact command, e.g. `pnpm run typecheck`>
+   - <exact command, e.g. `pnpm exec jest path/to/file.test.ts`>
+5. **Drift guard**: do not run `git add` / `commit` / `push` / `stash` yourself. If a failure is in a
+   file you did not touch, report it; do not fix it.
+6. **Check-off**: in `vault/tickets/<ID>.md` set `status: done`, tick the acceptance boxes and append a
+   `## Log` entry. (Dependent tickets only unblock once this lands on `main`.)
+7. **Final report**: files changed, behaviour, test names + pass counts, check-off status, blockers.
+
+When everything is green, finish with exactly this line, then stop:
+
+bash .agent-kit/agents/agent-finish.sh <name> main "<type(scope): title (<ID>)>"
+
+Then stop.
